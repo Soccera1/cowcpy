@@ -28,6 +28,10 @@ int cow_free(void *ptr);
  * ordinary buffers use memcpy. Frozen buffers are valid read-only sources.
  * API calls are internally synchronized. Callers must synchronize conflicting
  * buffer accesses; see README.md for page-level, signal, and I/O restrictions.
+ * Mutable-source remapping additionally excludes concurrent source readers;
+ * use MUTABLE_SNAPSHOTS=0 or freeze the source to permit concurrent readers.
+ * This function aborts on a frozen/poisoned managed destination or an
+ * unrecoverable remap. Use cow_memcpy_checked for a non-aborting copy API.
  * SIGNAL_MODE=single builds require single-threaded deferred buffer access. */
 void *cow_memcpy(void *dst, const void *src, size_t size);
 /* Avoid destructive fixed remapping. Returns 0 or -1 with errno. */
@@ -41,9 +45,12 @@ int cow_thaw(void *ptr);
 /* Minimum size at which page optimizations are considered. */
 void cow_set_min_copy(size_t size);
 unsigned long cow_features(void);
+/* Retry unlinking backing names retained after an earlier cleanup failure.
+ * Returns 0 if none remain, or -1 with errno. Also attempted at normal exit. */
+int cow_cleanup(void);
 
 /* Resolve all deferred copies before kernel I/O. This may run concurrently
- * with valid buffer access. On Linux it is a no-op. */
+ * with valid buffer access. For the default backends it is a no-op. */
 int cow_materialize(void);
 int cow_materialize_range(const void *ptr, size_t size);
 size_t cow_page_size(void);

@@ -65,18 +65,26 @@ build/test-features-signal: tests/test_features.c $(SOURCES) $(HEADERS) build/co
 build/test-vm-failures: tests/test_vm_failures.c $(SOURCES) $(HEADERS) build/cowcpy_config.h
 	$(CC) $(BUILD_CPPFLAGS) $(CFLAGS) -DCOWCPY_TEST_VM $(SOURCES) $< $(LDFLAGS) $(LIBS) -o $@
 
+build/test-backing-shm: tests/test_backing.c $(SOURCES) $(HEADERS) build/cowcpy_config.h
+	$(CC) $(BUILD_CPPFLAGS) -Isrc $(CFLAGS) -DCOWCPY_TEST_BACKING -DCOW_BACKING_REQUEST=2 -DTEST_SHM=1 $(SOURCES) $< $(LDFLAGS) $(LIBS) -o $@
+
+build/test-backing-tmp: tests/test_backing.c $(SOURCES) $(HEADERS) build/cowcpy_config.h
+	$(CC) $(BUILD_CPPFLAGS) -Isrc $(CFLAGS) -DCOWCPY_TEST_BACKING -DCOW_BACKING_REQUEST=3 -DTEST_SHM=0 $(SOURCES) $< $(LDFLAGS) $(LIBS) -o $@
+
 build/test-publication: tests/probe_publication.c $(SOURCES) $(HEADERS) build/cowcpy_config.h
 	$(CC) $(BUILD_CPPFLAGS) $(CFLAGS) -DCOWCPY_FORCE_SIGNAL -DCOWCPY_SIGNAL_DIRECT=0 -DCOWCPY_SIGNAL_LAZY=1 -DCOWCPY_TEST_HOOKS $(SOURCES) $< $(LDFLAGS) $(LIBS) -o $@
 
-check: build/test build/test-features build/test-threads build/test-signal build/test-features-signal build/test-threads-alias build/test-publication build/test-vm-failures
+check: build/test build/test-features build/test-threads build/test-signal build/test-features-signal build/test-threads-alias build/test-publication build/test-vm-failures build/test-backing-shm build/test-backing-tmp
 	./build/test
 	./build/test-features
 	./build/test-threads
 	./build/test-signal
 	./build/test-features-signal
 	./build/test-threads-alias
-	./build/test-publication
+	./build/test-publication || { status=$$?; test $$status -eq 77; }
 	./build/test-vm-failures
+	./build/test-backing-shm || { status=$$?; test $$status -eq 77; }
+	./build/test-backing-tmp || { status=$$?; test $$status -eq 77; }
 
 install: build/libcowcpy.a build/libcowcpy.so
 	install -d $(DESTDIR)$(PREFIX)/include $(DESTDIR)$(PREFIX)/lib

@@ -101,7 +101,7 @@ int main(void)
     cow_set_min_copy(0);
     if (!(cow_features() & COW_FEATURE_SIGNAL)) {
         puts("signal publication probe skipped: no usable signal backing");
-        return 0;
+        return 77;
     }
     src = cow_alloc(page);
     dst = cow_alloc(page);

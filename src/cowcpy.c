@@ -58,6 +58,9 @@
 #ifndef COW_MUTABLE_SNAPSHOTS
 #define COW_MUTABLE_SNAPSHOTS 1
 #endif
+#ifndef COW_HAVE_MKOSTEMP
+#define COW_HAVE_MKOSTEMP 0
+#endif
 #if COW_HAVE_MACH
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -66,6 +69,20 @@
 #ifdef COWCPY_TEST_VM
 extern void *cow_test_mmap(void *, size_t, int, int, int, off_t);
 #define mmap cow_test_mmap
+#endif
+#ifdef COWCPY_TEST_BACKING
+extern int cow_test_unlink(const char *);
+extern int cow_test_shm_unlink(const char *);
+extern int cow_test_shm_open(const char *, int, mode_t);
+extern int cow_test_open(const char *, int, ...);
+#define unlink cow_test_unlink
+#define shm_unlink cow_test_shm_unlink
+#define shm_open cow_test_shm_open
+#define open cow_test_open
+#if COW_HAVE_MKOSTEMP
+extern int cow_test_mkostemp(char *, int);
+#define mkostemp cow_test_mkostemp
+#endif
 #endif
 
 enum backend { EAGER, MAPPED, MACH, SIGNAL };
@@ -97,6 +114,103 @@ static atomic_size_t minimum_copy;
 static atomic_ulong backing_serial;
 #endif
 
+struct cleanup_entry {
+    int fd;
+    int shared;
+    struct cleanup_entry *next;
+    char name[];
+};
+static pthread_mutex_t cleanup_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct cleanup_entry *pending_cleanup;
+
+static int remove_name(const char *name, int shared)
+{
+    int result;
+    do {
+#if COW_HAVE_SHM
+        result = shared ? shm_unlink(name) : unlink(name);
+#else
+        (void)shared;
+        result = unlink(name);
+#endif
+    } while (result < 0 && errno == EINTR);
+    return result;
+}
+
+static void retain_cleanup(struct cleanup_entry *entry, int fd)
+{
+    entry->fd = fd;
+    pthread_mutex_lock(&cleanup_mutex);
+    entry->next = pending_cleanup;
+    pending_cleanup = entry;
+    pthread_mutex_unlock(&cleanup_mutex);
+}
+
+/* Keep both the original descriptor and name on failure. Identity checks
+ * prevent a later cleanup from deleting a replacement at the same name. */
+static int retry_cleanup(void)
+{
+    struct cleanup_entry **link;
+    int error = 0;
+    int saved = errno;
+    pthread_mutex_lock(&cleanup_mutex);
+    for (link = &pending_cleanup; *link;) {
+        struct cleanup_entry *entry = *link;
+        struct stat original;
+        struct stat named;
+        int result;
+        if (fstat(entry->fd, &original) < 0) {
+            error = errno;
+            link = &entry->next;
+            continue;
+        }
+#if COW_HAVE_SHM
+        if (entry->shared) {
+            int fd = shm_open(entry->name, O_RDONLY, 0);
+            if (fd < 0) {
+                result = -1;
+            } else {
+                int lookup_error;
+                result = fstat(fd, &named);
+                lookup_error = errno;
+                close(fd);
+                errno = lookup_error;
+            }
+        } else
+#endif
+        {
+            result = lstat(entry->name, &named);
+        }
+        if (result < 0 && errno != ENOENT) {
+            error = errno;
+            link = &entry->next;
+            continue;
+        }
+        if (result == 0 && original.st_dev == named.st_dev &&
+            original.st_ino == named.st_ino && remove_name(entry->name, entry->shared) < 0 &&
+            errno != ENOENT) {
+            error = errno;
+            link = &entry->next;
+            continue;
+        }
+        *link = entry->next;
+        close(entry->fd);
+        free(entry);
+    }
+    pthread_mutex_unlock(&cleanup_mutex);
+    if (error) {
+        errno = error;
+        return -1;
+    }
+    errno = saved;
+    return 0;
+}
+
+static void cleanup_at_exit(void)
+{
+    (void)retry_cleanup();
+}
+
 static int resize_backing(int fd, size_t size)
 {
     off_t length = (off_t)size;
@@ -127,23 +241,31 @@ static int shm_backing(size_t size)
 #if COW_HAVE_SHM
     unsigned attempt;
     for (attempt = 0; attempt < 32; ++attempt) {
-        char name[96];
+        struct cleanup_entry *entry = malloc(sizeof(*entry) + 96);
         unsigned long serial = atomic_fetch_add(&backing_serial, 1);
         int fd;
-        snprintf(name, sizeof(name), "/cowcpy-%lu-%lu",
+        if (!entry)
+            return -1;
+        entry->shared = 1;
+        snprintf(entry->name, 96, "/cowcpy-%lu-%lu",
                  (unsigned long)getpid(), serial);
-        fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+        /* POSIX shm_open sets FD_CLOEXEC as part of opening the object. */
+        fd = shm_open(entry->name, O_RDWR | O_CREAT | O_EXCL, 0600);
         if (fd < 0) {
+            int saved = errno;
+            free(entry);
+            errno = saved;
             if (errno == EEXIST)
                 continue;
             return -1;
         }
-        if (shm_unlink(name) < 0) {
+        if (remove_name(entry->name, 1) < 0) {
             int saved = errno;
-            close(fd);
+            retain_cleanup(entry, fd);
             errno = saved;
             return -1;
         }
+        free(entry);
         return finish_backing(fd, size);
     }
     errno = EEXIST;
@@ -157,29 +279,51 @@ static int shm_backing(size_t size)
 static int disk_backing(size_t size)
 {
     const char *directory = getenv("TMPDIR");
-    char *name;
+    struct cleanup_entry *entry;
     size_t length;
     int fd;
     int saved;
     if (!directory || !*directory)
         directory = "/tmp";
     length = strlen(directory);
-    if (length > SIZE_MAX - 24) {
+    if (length > SIZE_MAX - sizeof(*entry) - 96) {
         errno = ENAMETOOLONG;
         return -1;
     }
-    name = malloc(length + 24);
-    if (!name)
+    entry = malloc(sizeof(*entry) + length + 96);
+    if (!entry)
         return -1;
-    snprintf(name, length + 24, "%s/cowcpy-XXXXXX", directory);
-    fd = mkstemp(name);
-    saved = errno;
-    if (fd >= 0 && unlink(name) < 0) {
-        saved = errno;
-        close(fd);
+    entry->shared = 0;
+#if COW_HAVE_MKOSTEMP
+    snprintf(entry->name, length + 96, "%s/cowcpy-XXXXXX", directory);
+    fd = mkostemp(entry->name, O_CLOEXEC);
+#elif defined(O_CLOEXEC)
+    {
+        static atomic_ulong serial;
+        unsigned attempt;
         fd = -1;
+        for (attempt = 0; attempt < 32; ++attempt) {
+            unsigned long number = atomic_fetch_add(&serial, 1);
+            snprintf(entry->name, length + 96, "%s/cowcpy-%lu-%lu", directory,
+                     (unsigned long)getpid(), number);
+            fd = open(entry->name, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+            if (fd >= 0 || errno != EEXIST)
+                break;
+        }
     }
-    free(name);
+#else
+    /* Avoid a fork/exec descriptor leak on hosts without atomic CLOEXEC. */
+    errno = ENOTSUP;
+    fd = -1;
+#endif
+    saved = errno;
+    if (fd >= 0 && remove_name(entry->name, 0) < 0) {
+        saved = errno;
+        retain_cleanup(entry, fd);
+        errno = saved;
+        return -1;
+    }
+    free(entry);
     errno = saved;
     return finish_backing(fd, size);
 }
@@ -189,6 +333,8 @@ static int disk_backing(size_t size)
 int cow_backing_create(size_t size)
 {
     int fd;
+    if (retry_cleanup() < 0)
+        return -1;
     if (COW_BACKING_REQUEST == 4) {
         errno = ENOTSUP;
         return -1;
@@ -275,13 +421,14 @@ static int mach_usable(void)
 static void initialize(void)
 {
     long value = sysconf(_SC_PAGESIZE);
-    int fd;
+    int fd = -1;
     int result;
     if (value <= 0) {
         initialization_error = ENOSYS;
         return;
     }
     page_size = (size_t)value;
+    (void)atexit(cleanup_at_exit);
 #if COW_MIN_PAGES == 0
     atomic_store(&minimum_copy, 0);
 #else
@@ -310,7 +457,6 @@ static void initialize(void)
         }
     }
 #endif
-    (void)fd;
     if (selected == SIGNAL) {
         selected_name = cow_signal_backend();
         if (strcmp(selected_name, "signal") == 0) {
@@ -344,7 +490,7 @@ static struct allocation *find_allocation(const void *ptr, size_t size)
     struct allocation *item;
     for (item = allocations; item; item = item->next) {
         uintptr_t base = (uintptr_t)item->base;
-        if (address >= base && address - base <= item->size &&
+        if (address >= base && address - base < item->size &&
             size <= item->size - (size_t)(address - base))
             return item;
     }
@@ -733,8 +879,6 @@ void *cow_memcpy(void *restrict dst, const void *restrict src, size_t size)
         } else {
             cow_signal_memcpy(dst, src, size);
         }
-    } else if (size < atomic_load(&minimum_copy)) {
-        memcpy(dst, src, size);
     } else if (copy_native(dst, src, size, 0) < 0) {
         /* Only an invalid frozen destination or unrecoverable VM replacement
          * can reach this point. Use checked copies to avoid fixed remaps. */
@@ -756,6 +900,17 @@ int cow_materialize(void)
     if (ensure_initialized() < 0)
         return -1;
     return selected == SIGNAL ? cow_signal_materialize() : 0;
+}
+
+int cow_cleanup(void)
+{
+    int result;
+    if (ensure_initialized() < 0)
+        return -1;
+    enter_call();
+    result = retry_cleanup();
+    leave_call();
+    return result;
 }
 
 int cow_freeze(void *ptr)
@@ -869,13 +1024,14 @@ void *cow_memdup(const void *src, size_t size)
         return result;
     }
     mapping = mmap(NULL, mapped, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, offset);
-    saved = errno;
     if (owned)
         close(fd);
     if (mapping == MAP_FAILED) {
         unlock_pair(a, unused);
-        errno = saved;
-        return NULL;
+        result = cow_alloc(size);
+        if (result)
+            memcpy(result, src, size);
+        return result;
     }
     copy = calloc(1, sizeof(*copy));
     if (!copy) {

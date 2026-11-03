@@ -8,6 +8,12 @@ Ordinary buffers work with `cow_memcpy`. Allocate with `cow_alloc` to make
 buffers eligible for page optimizations. As with `memcpy`, ranges must be
 valid and non-overlapping.
 
+With mutable-source remapping enabled, exclude concurrent source readers
+during copying. Use `MUTABLE_SNAPSHOTS=0` or freeze the source when readers
+must run concurrently. `cow_memcpy` aborts on library-detected invalid managed
+destinations or unrecoverable remapping failures. Use `cow_memcpy_checked`
+to receive library errors through its return value instead.
+
 ## Build
 
 ```sh
@@ -91,6 +97,7 @@ Include [cowcpy.h](include/cowcpy.h).
 | `cow_page_size()` | Host page size, or 0 on initialization failure. |
 | `cow_backend()` | Selected backend: `mapped`, `mach`, `signal`, or `eager`. |
 | `cow_features()` | Runtime feature bits defined in the public header. |
+| `cow_cleanup()` | Retry retained backing-name cleanup; returns 0 or -1 with `errno`. Also attempted at normal exit. |
 
 ## Feature selection
 

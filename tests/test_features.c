@@ -42,6 +42,29 @@ static void custom_segv(int signal_number)
     _exit(99);
 }
 
+static void test_frozen_abort_sizes(unsigned char *frozen, const void *src,
+                                    size_t size)
+{
+    const size_t counts[] = {1, size};
+    size_t i;
+    cow_set_min_copy(4 * page);
+    for (i = 0; i < sizeof(counts) / sizeof(counts[0]); ++i) {
+        pid_t child = fork();
+        int status;
+        assert(child >= 0);
+        if (!child) {
+            struct rlimit limit = {0, 0};
+            assert(setrlimit(RLIMIT_CORE, &limit) == 0);
+            alarm(3);
+            cow_memcpy(frozen, src, counts[i]);
+            _exit(1);
+        }
+        assert(waitpid(child, &status, 0) == child);
+        assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+    }
+    cow_set_min_copy(0);
+}
+
 static void test_signal_ownership(void)
 {
     struct sigaction original;
@@ -83,6 +106,7 @@ static void test_clone_and_freeze(void)
     if (frozen) {
         errno = 0;
         assert(cow_memcpy_checked(src, dst, page) == -1 && errno == EPERM);
+        test_frozen_abort_sizes(src, dst, 8 * page);
         assert(cow_thaw(src) == 0);
     }
     src[0] = 0;

@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -247,20 +248,77 @@ static void test_unrelated_signal(void)
     assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV);
 }
 
+static void test_unrelated_protection_faults(void)
+{
+    unsigned variant;
+    if (!signal_backend)
+        return;
+    for (variant = 0; variant < 4; ++variant) {
+        pid_t child = fork();
+        int status;
+        assert(child >= 0);
+        if (!child) {
+            struct rlimit limit = {0, 0};
+            unsigned char *src = cow_alloc(3 * page);
+            unsigned char *dst = cow_alloc(3 * page);
+            volatile unsigned char sink;
+            assert(src && dst);
+            assert(setrlimit(RLIMIT_CORE, &limit) == 0);
+            alarm(3);
+            cow_memcpy(dst, src, page);
+            if (variant != 0) {
+                /* These pages have real retirement records, which still
+                 * must not cause an unrelated later fault to retry forever. */
+                assert(cow_materialize() == 0);
+                assert(mprotect(dst, page, PROT_NONE) == 0);
+            } else {
+                /* A never-protected page in a live managed allocation. */
+                assert(mprotect(dst + page, page, PROT_NONE) == 0);
+            }
+            if (variant >= 2) {
+                /* Invalid source access during an eager fallback while the
+                 * signal backend owns state_lock: fail rather than deadlock. */
+                char ordinary[8];
+                if (variant == 2)
+                    cow_memcpy(ordinary, dst, sizeof(ordinary));
+                else
+                    cow_memcpy(src + page + 1, dst, page + 1);
+            } else {
+                sink = ((volatile unsigned char *)dst)[variant ? 0 : page];
+                (void)sink;
+            }
+            _exit(1);
+        }
+        assert(waitpid(child, &status, 0) == child);
+        assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV);
+    }
+}
+
 #if defined(__linux__)
-static char mapping_type(const void *ptr)
+struct mapping {
+    char permissions[5];
+    unsigned device_major;
+    unsigned device_minor;
+    unsigned long long inode;
+    unsigned long long offset;
+    int found;
+};
+
+static struct mapping mapping_info(const void *ptr)
 {
     FILE *maps = fopen("/proc/self/maps", "r");
     char line[512];
-    char result = '?';
+    struct mapping result = {{0}, 0, 0, 0, 0, 0};
     assert(maps);
     while (fgets(line, sizeof(line), maps)) {
         unsigned long start, end;
-        char permissions[5];
-        if (sscanf(line, "%lx-%lx %4s", &start, &end, permissions) == 3 &&
+        struct mapping candidate = {{0}, 0, 0, 0, 0, 0};
+        if (sscanf(line, "%lx-%lx %4s %llx %x:%x %llu", &start, &end,
+                   candidate.permissions, &candidate.offset, &candidate.device_major,
+                   &candidate.device_minor, &candidate.inode) == 7 &&
             (uintptr_t)ptr >= start && (uintptr_t)ptr < end) {
-            assert(strstr(line, "memfd:cowcpy"));
-            result = permissions[3];
+            result = candidate;
+            result.found = 1;
             break;
         }
     }
@@ -272,19 +330,54 @@ static void test_linux_mappings(void)
 {
     unsigned char *src;
     unsigned char *dst;
-    if (strcmp(cow_backend(), "memfd") != 0)
+    unsigned char *other;
+    struct mapping source;
+    struct mapping destination;
+    struct mapping second;
+    FILE *maps;
+    if (strcmp(cow_backend(), "mapped") != 0)
         return;
+    maps = fopen("/proc/self/maps", "r");
+    if (!maps) {
+        puts("Linux mapping checks skipped: /proc/self/maps unavailable");
+        return;
+    }
+    fclose(maps);
     src = cow_alloc(page);
     dst = cow_alloc(page);
-    assert(src && dst);
+    other = cow_alloc(page);
+    assert(src && dst && other);
     memset(src, 42, page);
-    assert(mapping_type(src) == 's');
-    cow_memcpy(dst, src, page);
-    assert(mapping_type(src) == 'p');
-    assert(mapping_type(dst) == 'p');
-    assert(dst[0] == 42);
+    source = mapping_info(src);
+    destination = mapping_info(dst);
+    assert(source.found && destination.found);
+    assert(strcmp(source.permissions, "rw-p") == 0 && source.inode == 0);
+    assert(strcmp(destination.permissions, "rw-p") == 0 && destination.inode == 0);
+    if (cow_features() & COW_FEATURE_REMAP) {
+        /* Frozen copies work with both mutable-snapshot policies and all
+         * backing providers. Verify sharing by file identity, not its name. */
+        assert(cow_freeze(src) == 0);
+        cow_memcpy(dst, src, page);
+        cow_memcpy(other, src, page);
+        destination = mapping_info(dst);
+        second = mapping_info(other);
+        assert(destination.found && second.found);
+        assert(strcmp(destination.permissions, "rw-p") == 0);
+        assert(strcmp(second.permissions, "rw-p") == 0);
+        assert(destination.inode != 0 && destination.inode == second.inode);
+        assert(destination.device_major == second.device_major);
+        assert(destination.device_minor == second.device_minor);
+        assert(destination.offset == second.offset);
+        dst[0] = 7;
+        assert(src[0] == 42 && other[0] == 42);
+        assert(cow_thaw(src) == 0);
+        src[0] = 9;
+        assert(other[0] == 42);
+        puts("Linux mapping checks: private allocations and shared snapshot backing passed");
+    }
     assert(cow_free(src) == 0);
     assert(cow_free(dst) == 0);
+    assert(cow_free(other) == 0);
 }
 #endif
 
@@ -304,6 +397,7 @@ int main(void)
     test_free_pending();
     test_materialize_io();
     test_unrelated_signal();
+    test_unrelated_protection_faults();
 #if defined(__linux__)
     test_linux_mappings();
 #endif

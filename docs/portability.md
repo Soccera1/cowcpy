@@ -9,8 +9,19 @@ be created, or eager copying otherwise. Native Mach behavior still needs
 validation on Apple hardware; development tests run on Linux.
 
 Backing selection is independent: `BACKING=auto` tries Linux `memfd_create`,
-then POSIX `shm_open`. Objects are unlinked immediately and descriptors are
-close-on-exec. Ordinary allocations are private anonymous mappings, so backing
+then POSIX `shm_open`. Objects are normally unlinked immediately. If removal
+fails, the library retains the name and original descriptor for identity-checked
+cleanup retries. It retries interrupted removals immediately and other failures
+before creating another backing, through `cow_cleanup`, and at normal exit.
+Persistent permission or filesystem errors can still leave named objects;
+`cow_cleanup` reports them instead of discarding the cleanup state. Retrying
+cleanup requires exclusive ownership of the generated names; other code must
+not concurrently replace objects at those names.
+
+POSIX shared-memory descriptors are close-on-exec at creation. Disk backing
+uses detected `mkostemp(O_CLOEXEC)`, or exclusive `open(O_CLOEXEC)` when that
+extension is unavailable. Hosts without atomic close-on-exec disk creation
+use eager fallback. Ordinary allocations are private anonymous mappings, so backing
 restrictions do not prevent allocation. If a snapshot cannot create or fill
 its backing, copying falls back to `memcpy`. Disk files are used only with
 `BACKING=tmp` or `ALLOW_DISK=1`; `TMPDIR` controls their location.
@@ -28,7 +39,8 @@ descriptor limits, or memory pressure can still require fallback or an error.
 
 ## Large copies and snapshots
 
-The default threshold is four host pages. Smaller copies use libc directly.
+The default threshold is four host pages. Smaller copies use libc without
+page remapping; managed destinations still receive validity/frozen checks.
 The mapped backend optimizes complete interior pages only when both addresses
 have matching page offsets and belong to eligible managed allocations. Partial
 pages, different offsets, and ordinary buffers use eager copying. The Mach
@@ -50,8 +62,9 @@ supported by the optional signal backend.
 `cow_memdup` maps its result at a new address, so it avoids fixed-address
 replacement. For ordinary sources it first captures the bytes; small clones
 and unavailable backing use allocation plus `memcpy`. It does not modify or
-remap the source. Managed allocation size rounding does not permit accessing
-bytes beyond the requested size.
+remap the source. Callers must limit accesses to the requested allocation size.
+Page rounding may leave extra bytes hardware-accessible in the last page;
+the allocator does not provide guard pages or redzones.
 
 ## Threads and fork
 
@@ -110,6 +123,13 @@ replacement path globally; `cow_memcpy_checked` and `cow_memdup` avoid it per
 operation. Ordinary out-of-memory faults and device/kernel failures remain
 outside the guarantees of a memcpy-shaped API.
 
+There is no portable query that establishes that a failed replacement left
+the original mapping, backing identity, and access protections intact.
+Residency information alone would not prove this. A double replacement failure
+therefore remains conservative, even on a host that may have preserved the
+original mapping. Checked copies provide a non-aborting channel for detected
+library errors; they still require valid caller memory.
+
 ## Optional synchronous-fault backend
 
 `BACKEND=signal` explicitly opts into host support beyond POSIX. Its build
@@ -131,6 +151,11 @@ This path must be validated on its target OS. Asynchronous callbacks must
 not call the library or access managed buffers. Existing SIGSEGV handlers
 cause eager fallback; do not replace or block the library's handler while
 copies are pending. Permission-restoration failures in a fault are fatal.
+Only pages with a recorded library retirement generation qualify for a delayed
+fault retry. Repeated faults on that page/generation fail with the default
+signal disposition. Faults inside a library critical section also fail closed
+instead of attempting to lock the same mutex recursively. Managed allocations
+are not a blanket exemption from genuine protection faults.
 
 Hidden aliases consume additional virtual addresses and shared backing.
 Do not use live signal-backend allocations across fork: their shared public

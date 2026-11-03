@@ -65,6 +65,13 @@ int main(void)
     assert(clone && memcmp(clone, src, size) == 0);
     assert(fixed_calls == 0);
     assert(cow_free(clone) == 0);
+    if (strcmp(cow_backend(), "mapped") == 0) {
+        fail_preflight = 1;
+        clone = cow_memdup(src, size);
+        assert(clone && fail_preflight == 0);
+        assert(memcmp(clone, src, size) == 0 && fixed_calls == 0);
+        assert(cow_free(clone) == 0);
+    }
     assert(cow_free(src) == 0);
     assert(cow_free(dst) == 0);
     puts("VM failures: destructive-failure recovery and non-destructive copy APIs passed");

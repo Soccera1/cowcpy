@@ -41,6 +41,7 @@ struct allocation {
     size_t size;
     size_t mapped;
     unsigned flags;
+    uint64_t *retired;
 #if !COWCPY_SIGNAL_DIRECT
     unsigned char *alias;
     int backing_fd;
@@ -51,12 +52,17 @@ struct allocation {
 static struct allocation *allocations;
 static size_t page_size;
 static pthread_mutex_t state_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Thread_local volatile sig_atomic_t entering_state_lock;
+static _Thread_local uintptr_t last_retry_page;
+static _Thread_local uint64_t last_retry_generation;
+static uint64_t next_generation;
 
 /* This opt-in backend requires host support for mutex operations inside a
  * controlled synchronous handler. It is never selected by POSIX auto mode.
  * API code resolves protected pages before accessing caller memory. */
 static void lock_state(void)
 {
+    entering_state_lock = 1;
     if (pthread_mutex_lock(&state_lock) != 0)
         _exit(127);
 }
@@ -65,6 +71,7 @@ static void unlock_state(void)
 {
     if (pthread_mutex_unlock(&state_lock) != 0)
         _exit(127);
+    entering_state_lock = 0;
 }
 
 static size_t get_page_size(void)
@@ -91,7 +98,7 @@ static struct allocation *find_allocation(const void *ptr, size_t size)
     struct allocation *item;
     for (item = allocations; item; item = item->next) {
         uintptr_t base = (uintptr_t)item->base;
-        if (address >= base && address - base <= item->size &&
+        if (address >= base && address - base < item->size &&
             size <= item->size - (size_t)(address - base))
             return item;
     }
@@ -102,6 +109,9 @@ struct deferred_page {
     unsigned char *src;
     unsigned char *dst;
     unsigned char *fill;
+    struct allocation *src_allocation;
+    struct allocation *dst_allocation;
+    uint64_t generation;
     int active;
 };
 
@@ -148,6 +158,10 @@ static int resolve_page(struct deferred_page *page)
 #endif
     if (mprotect(page->src, page_size, PROT_READ | PROT_WRITE) < 0)
         return -1;
+    page->src_allocation->retired[(size_t)(page->src - page->src_allocation->base) /
+                                  page_size] = page->generation;
+    page->dst_allocation->retired[(size_t)(page->dst - page->dst_allocation->base) /
+                                  page_size] = page->generation;
     page->active = 0;
     return 0;
 }
@@ -162,30 +176,43 @@ static void segv_handler(int signal_number, siginfo_t *info, void *context)
 #ifdef COWCPY_TEST_HOOKS
     cow_test_fault_enter(info->si_addr);
 #endif
-    if (info->si_code == SEGV_ACCERR) {
+    if (info->si_code == SEGV_ACCERR && !entering_state_lock) {
         lock_state();
         for (batch = batches; batch; batch = batch->next) {
-          for (i = 0; i < batch->count; ++i) {
-            struct deferred_page *page = &batch->pages[i];
-            uintptr_t src = (uintptr_t)page->src;
-            uintptr_t dst = (uintptr_t)page->dst;
-            if ((fault >= src && fault - src < page_size) ||
-                (fault >= dst && fault - dst < page_size)) {
-                if (resolve_page(page) < 0)
-                    _exit(128 + signal_number);
+            for (i = 0; i < batch->count; ++i) {
+                struct deferred_page *page = &batch->pages[i];
+                uintptr_t src = (uintptr_t)page->src;
+                uintptr_t dst = (uintptr_t)page->dst;
+                if (page->active &&
+                    ((fault >= src && fault - src < page_size) ||
+                     (fault >= dst && fault - dst < page_size))) {
+                    if (resolve_page(page) < 0)
+                        _exit(128 + signal_number);
+                    last_retry_page = fault - fault % page_size;
+                    last_retry_generation = page->generation;
+                    unlock_state();
+                    errno = saved_errno;
+                    return;
+                }
+            }
+        }
+        /* A delayed fault may outlive its batch. Only pages actually resolved
+         * by us qualify for one retry per thread and generation. POSIX has no
+         * portable access-permission query: a repeated fault must be fatal. */
+        {
+            struct allocation *owner = find_allocation(info->si_addr, 1);
+            uintptr_t address = fault - fault % page_size;
+            uint64_t generation = 0;
+            if (owner && owner->retired)
+                generation = owner->retired[(fault - (uintptr_t)owner->base) / page_size];
+            if (generation && (address != last_retry_page ||
+                               generation != last_retry_generation)) {
+                last_retry_page = address;
+                last_retry_generation = generation;
                 unlock_state();
                 errno = saved_errno;
                 return;
             }
-          }
-        }
-        /* The fault may have been delivered before another handler or API
-         * call resolved and retired its record. A live owned address is now
-         * accessible; retry it without touching the retired metadata. */
-        if (find_allocation(info->si_addr, 1)) {
-            unlock_state();
-            errno = saved_errno;
-            return;
         }
         unlock_state();
     }
@@ -313,6 +340,11 @@ static int lazy_copy(struct allocation *src_alloc,
         struct deferred_page *page = &batch->pages[i];
         page->src = src + i * page_size;
         page->dst = dst + i * page_size;
+        page->src_allocation = src_alloc;
+        page->dst_allocation = dst_alloc;
+        if (++next_generation == 0)
+            ++next_generation;
+        page->generation = next_generation;
 #if COWCPY_SIGNAL_DIRECT
         page->fill = page->dst;
 #else
@@ -379,6 +411,13 @@ static void *alloc_locked(size_t size, unsigned flags)
     if (!item)
         return NULL;
     item->flags = flags;
+    if (!(flags & COW_ALLOC_EAGER)) {
+        item->retired = calloc(mapped / page, sizeof(*item->retired));
+        if (!item->retired) {
+            item->flags |= COW_ALLOC_EAGER;
+            flags = item->flags;
+        }
+    }
 #if !COWCPY_SIGNAL_DIRECT
     item->backing_fd = -1;
 #endif
@@ -417,6 +456,7 @@ mapping_ready:
         if (item->backing_fd >= 0)
             close(item->backing_fd);
 #endif
+        free(item->retired);
         free(item);
         errno = saved_errno;
         return NULL;
@@ -454,6 +494,7 @@ static int free_locked(void *ptr)
     if (item->backing_fd >= 0)
         close(item->backing_fd);
 #endif
+    free(item->retired);
     free(item);
     return 0;
 }

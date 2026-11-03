@@ -44,6 +44,14 @@ int main(void) { return mach_vm_copy(mach_task_self(), 0, 0, 0) != KERN_SUCCESS;
 EOF
 mach=0
 if compile >"$work/log" 2>&1; then mach=1; fi
+cat >"$work/probe.c" <<'EOF'
+#define _GNU_SOURCE
+#include <stdlib.h>
+#include <fcntl.h>
+int main(void) { int (*create_file)(char *, int) = mkostemp; return create_file == 0 || O_CLOEXEC == 0; }
+EOF
+mkostemp=0
+if compile >"$work/log" 2>&1; then mkostemp=1; fi
 case "$backend" in
     auto) backend_id=0;; mapped) backend_id=1;; mach) backend_id=2;;
     signal) backend_id=3;; eager) backend_id=4;;
@@ -67,7 +75,7 @@ if [ "$remap" = auto ]; then
     elif $CC $CPPFLAGS $CFLAGS -Iinclude -Isrc -DCOWCPY_TEST_VM \
         -DCOW_BACKEND_REQUEST=1 -DCOW_BACKING_REQUEST="$backing_id" \
         -DCOW_ALLOW_DISK="$allow_disk" -DCOW_HAVE_MEMFD="$memfd" \
-        -DCOW_HAVE_SHM="$shm" -DCOW_HAVE_MACH=0 \
+        -DCOW_HAVE_SHM="$shm" -DCOW_HAVE_MACH=0 -DCOW_HAVE_MKOSTEMP="$mkostemp" \
         src/cowcpy.c src/signal.c tests/probe_mapped.c \
         $LDFLAGS $libs -pthread -o "$work/mapped" >"$work/log" 2>&1 &&
         "$work/mapped" >>"$work/log" 2>&1; then
@@ -85,14 +93,21 @@ if [ "$backend" = signal ] && [ "$signal_mode" = auto ]; then
         if $CC $CPPFLAGS $CFLAGS -Iinclude -Isrc -DCOWCPY_FORCE_SIGNAL \
             -DCOWCPY_TEST_HOOKS -DCOWCPY_SIGNAL_DIRECT=0 -DCOW_MIN_PAGES=0 \
             -DCOW_HAVE_MEMFD="$memfd" -DCOW_HAVE_SHM="$shm" \
+            -DCOW_BACKING_REQUEST="$backing_id" -DCOW_ALLOW_DISK="$allow_disk" \
+            -DCOW_HAVE_MKOSTEMP="$mkostemp" \
             src/cowcpy.c src/signal.c tests/probe_publication.c \
             $LDFLAGS $libs -pthread -o "$work/signal" >"$work/log" 2>&1 &&
             "$work/signal" >>"$work/log" 2>&1; then
             echo 'cowcpy: opt-in synchronized signal probe passed (host extensions required)' >&2
         else
+            status=$?
             lazy=0
             direct=1
-            echo 'cowcpy: signal probe failed; selecting eager fallback' >&2
+            if [ "$status" = 77 ]; then
+                echo 'cowcpy: signal probe skipped (backend unavailable); selecting eager fallback' >&2
+            else
+                echo 'cowcpy: signal probe failed; selecting eager fallback' >&2
+            fi
             cat "$work/log" >&2
         fi
     fi
@@ -102,8 +117,13 @@ fi
     echo "#define COW_HAVE_MEMFD $memfd"
     echo "#define COW_HAVE_SHM $shm"
     echo "#define COW_HAVE_MACH $mach"
+    echo '#ifndef COW_HAVE_MKOSTEMP'
+    echo "#define COW_HAVE_MKOSTEMP $mkostemp"
+    echo '#endif'
     echo "#define COW_BACKEND_REQUEST $backend_id"
+    echo '#ifndef COW_BACKING_REQUEST'
     echo "#define COW_BACKING_REQUEST $backing_id"
+    echo '#endif'
     echo "#define COW_FIXED_REMAP $fixed"
     echo "#define COW_ALLOW_DISK $allow_disk"
     echo "#define COW_MIN_PAGES $min_pages"
