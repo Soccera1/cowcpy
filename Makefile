@@ -5,6 +5,7 @@ CFLAGS = -O2 -g -std=c11 -Wall -Wextra -Wpedantic -Werror
 LDFLAGS =
 LDLIBS =
 PREFIX = /usr/local
+VERSION ?= 0.1.0
 BACKEND ?= auto
 BACKING ?= auto
 REMAP ?= auto
@@ -21,7 +22,7 @@ SOURCES = src/cowcpy.c src/signal.c
 HEADERS = include/cowcpy.h src/internal.h
 
 .PHONY: all check clean install FORCE
-all: build/libcowcpy.a build/libcowcpy.so build/example
+all: build/libcowcpy.a build/libcowcpy.so build/cowcpy.pc build/example
 
 build:
 	mkdir -p build
@@ -40,6 +41,11 @@ build/libcowcpy.a: build/cowcpy.o build/signal.o
 
 build/libcowcpy.so: build/cowcpy.o build/signal.o
 	$(CC) $(CFLAGS) $(LDFLAGS) $(SHARED_LDFLAGS) $^ $(LIBS) -o $@
+
+build/cowcpy.pc: cowcpy.pc.in build/cowcpy_config.h FORCE | build
+	sed -e 's|@PREFIX@|$(PREFIX)|g' \
+	    -e 's|@VERSION@|$(VERSION)|g' \
+	    -e 's|@PRIVATE_LIBS@|$(LIBS)|g' $< > $@
 
 build/example: examples/basic.c build/libcowcpy.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) $< build/libcowcpy.a $(LIBS) -o $@
@@ -86,10 +92,11 @@ check: build/test build/test-features build/test-threads build/test-signal build
 	./build/test-backing-shm || { status=$$?; test $$status -eq 77; }
 	./build/test-backing-tmp || { status=$$?; test $$status -eq 77; }
 
-install: build/libcowcpy.a build/libcowcpy.so
-	install -d $(DESTDIR)$(PREFIX)/include $(DESTDIR)$(PREFIX)/lib
+install: build/libcowcpy.a build/libcowcpy.so build/cowcpy.pc
+	install -d $(DESTDIR)$(PREFIX)/include $(DESTDIR)$(PREFIX)/lib/pkgconfig
 	install -m 644 include/cowcpy.h $(DESTDIR)$(PREFIX)/include/
 	install -m 644 build/libcowcpy.a build/libcowcpy.so $(DESTDIR)$(PREFIX)/lib/
+	install -m 644 build/cowcpy.pc $(DESTDIR)$(PREFIX)/lib/pkgconfig/
 
 clean:
 	rm -rf build

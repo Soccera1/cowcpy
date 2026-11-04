@@ -38,6 +38,15 @@ cc -std=c89 -Iinclude app.c build/libcowcpy.a -pthread -o app
 Some older systems also need `-lrt`; detected extra libraries are recorded
 in `build/cowcpy.libs`. Install both libraries and the header with
 `make install PREFIX=/your/prefix`; `DESTDIR` is supported.
+Installation also provides `lib/pkgconfig/cowcpy.pc` for pkg-config:
+
+```sh
+cc app.c $(pkg-config --cflags --libs cowcpy) -o app
+```
+
+Use `pkg-config --static --libs cowcpy` for static linking dependencies.
+For a custom prefix, add its `lib/pkgconfig` directory to `PKG_CONFIG_PATH`.
+The package version defaults to `0.1.0` and can be set with `make VERSION=...`.
 
 ## Example
 

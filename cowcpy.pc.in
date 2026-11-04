@@ -1,0 +1,11 @@
+prefix=@PREFIX@
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: cowcpy
+Description: memcpy-compatible copy library with page-based copy-on-write optimizations
+Version: @VERSION@
+Libs: -L${libdir} -lcowcpy
+Libs.private: @PRIVATE_LIBS@
+Cflags: -I${includedir}
